@@ -26,9 +26,28 @@ local function resolveInstance(path: string): Instance?
 	local parts = string.split(normalized, ".")
 	local current: Instance = game
 	for _, part in parts do
-		local child = current:FindFirstChild(part)
-		if not child then return nil end
-		current = child
+		-- Handle disambiguated names like "Script[2]" for duplicate siblings
+		local name, indexStr = string.match(part, "^(.+)%[(%d+)%]$")
+		if name and indexStr then
+			local targetIndex = tonumber(indexStr) or 1
+			local count = 0
+			local found: Instance? = nil
+			for _, child in ipairs(current:GetChildren()) do
+				if child.Name == name then
+					count += 1
+					if count == targetIndex then
+						found = child
+						break
+					end
+				end
+			end
+			if not found then return nil end
+			current = found
+		else
+			local child = current:FindFirstChild(part)
+			if not child then return nil end
+			current = child
+		end
 	end
 	return current
 end
@@ -313,7 +332,26 @@ handlers["openScript"] = function(params)
 	if not ok then
 		return { opened = false, error = "ScriptEditorService unavailable: " .. tostring(err) }
 	end
-	return { opened = true, path = params.path }
+
+	-- If a line number was provided, scroll to it
+	local line = params.line
+	if line then
+		pcall(function()
+			local doc = (ScriptEditorService :: any):FindScriptDocument(instance)
+			if doc then
+				-- Move cursor to the target line (1-indexed line, 0-indexed char)
+				local targetLine = math.max(0, (line :: number) - 1)
+				doc:EditTextAsync(
+					{ ["start"] = { ["line"] = targetLine, ["character"] = 0 }, ["end"] = { ["line"] = targetLine, ["character"] = 0 } },
+					""
+				)
+				-- Request cursor position by selecting the line start
+				doc:RequestSetSelectionAsync(targetLine, 0, targetLine, 0)
+			end
+		end)
+	end
+
+	return { opened = true, path = params.path, line = line }
 end
 
 handlers["getEditorSource"] = function(params)
@@ -949,6 +987,97 @@ handlers["batch"] = function(params)
 	end
 
 	return { results = results, count = #results }
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- SESSION HIGHLIGHT
+-- ═══════════════════════════════════════════════════════════
+
+handlers["showSessionHighlight"] = function(_params)
+	local CoreGui = game:GetService("CoreGui")
+
+	-- Remove any existing highlight
+	local existing = CoreGui:FindFirstChild("RoStackSessionHighlight")
+	if existing then existing:Destroy() end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "RoStackSessionHighlight"
+	screenGui.DisplayOrder = 999999
+	screenGui.IgnoreGuiInset = true
+	screenGui.ResetOnSpawn = false
+
+	-- Border frame (full screen, acts as colored border)
+	local border = Instance.new("Frame")
+	border.Name = "Border"
+	border.Size = UDim2.new(1, 0, 1, 0)
+	border.Position = UDim2.new(0, 0, 0, 0)
+	border.BackgroundTransparency = 1
+	border.BorderSizePixel = 0
+	border.Parent = screenGui
+
+	local thickness = 4
+
+	-- Top edge
+	local top = Instance.new("Frame")
+	top.Size = UDim2.new(1, 0, 0, thickness)
+	top.Position = UDim2.new(0, 0, 0, 0)
+	top.BackgroundColor3 = Color3.fromRGB(11, 132, 255)
+	top.BorderSizePixel = 0
+	top.Parent = border
+
+	-- Bottom edge
+	local bottom = Instance.new("Frame")
+	bottom.Size = UDim2.new(1, 0, 0, thickness)
+	bottom.Position = UDim2.new(0, 0, 1, -thickness)
+	bottom.BackgroundColor3 = Color3.fromRGB(11, 132, 255)
+	bottom.BorderSizePixel = 0
+	bottom.Parent = border
+
+	-- Left edge
+	local left = Instance.new("Frame")
+	left.Size = UDim2.new(0, thickness, 1, 0)
+	left.Position = UDim2.new(0, 0, 0, 0)
+	left.BackgroundColor3 = Color3.fromRGB(11, 132, 255)
+	left.BorderSizePixel = 0
+	left.Parent = border
+
+	-- Right edge
+	local right = Instance.new("Frame")
+	right.Size = UDim2.new(0, thickness, 1, 0)
+	right.Position = UDim2.new(1, -thickness, 0, 0)
+	right.BackgroundColor3 = Color3.fromRGB(11, 132, 255)
+	right.BorderSizePixel = 0
+	right.Parent = border
+
+	-- Center label
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Size = UDim2.new(0, 260, 0, 44)
+	label.Position = UDim2.new(0.5, 0, 0.5, 0)
+	label.AnchorPoint = Vector2.new(0.5, 0.5)
+	label.BackgroundColor3 = Color3.fromRGB(11, 132, 255)
+	label.BackgroundTransparency = 0.15
+	label.BorderSizePixel = 0
+	label.Text = "Current Session"
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextSize = 18
+	label.Font = Enum.Font.GothamBold
+	label.Parent = screenGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = label
+
+	screenGui.Parent = CoreGui
+
+	-- Auto-dismiss after 3 seconds
+	task.delay(3, function()
+		if screenGui and screenGui.Parent then
+			screenGui:Destroy()
+		end
+	end)
+
+	return { shown = true }
 end
 
 -- ── Public API for registering custom command handlers ──

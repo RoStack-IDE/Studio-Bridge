@@ -20,6 +20,33 @@ APIClient.init(Config.SERVER_URL)
 -- Generate ephemeral session UUID at plugin startup
 local _ephemeralSessionId = HttpService:GenerateGUID(false)
 
+-- ── Persistent project ID via Workspace attribute ──
+-- This ID is saved with the place file and uniquely links it to its
+-- RoStack session, chat history, etc. — no reliance on PlaceId/GameId.
+local ATTR_NAME = "RoStackProjectId"
+
+local function getOrCreateProjectId(): string
+	local existing = game.Workspace:GetAttribute(ATTR_NAME)
+	if typeof(existing) == "string" and #existing > 0 then
+		Logger.step("Init", "Existing project ID: " .. existing)
+		return existing
+	end
+	local newId = HttpService:GenerateGUID(false)
+	local setOk, setErr = pcall(function()
+		game.Workspace:SetAttribute(ATTR_NAME, newId)
+	end)
+	if setOk then
+		-- Verify it was actually saved
+		local verify = game.Workspace:GetAttribute(ATTR_NAME)
+		Logger.step("Init", "Generated new project ID: " .. newId .. " (verified=" .. tostring(verify == newId) .. ")")
+	else
+		Logger.error("Init", "Failed to set project ID attribute: " .. tostring(setErr))
+	end
+	return newId
+end
+
+local _projectId = getOrCreateProjectId()
+
 -- ── Auto-discover and connect loop ──
 -- Polls the server's /api/discover endpoint to find a session.
 -- Once found, claims it and starts auto-sync. On disconnect, loops back.
@@ -44,16 +71,15 @@ task.spawn(function()
 				if data.success then
 					Logger.step("Init", "Session found! ID=" .. tostring(data.sessionId))
 
-					-- Build composite session context from game metadata
-					-- IDs may be 0 initially (Studio loads them async) — we'll re-send
-					-- plugin_hello once they become available
 					local gameContext = {
 						sessionId = _ephemeralSessionId,
+						projectId = _projectId,
+						placeName = game.Name or "Untitled",
 						universeId = tostring(game.GameId),
 						placeId = tostring(game.PlaceId),
 						placeVersion = tostring(game.PlaceVersion),
 					}
-					Logger.step("Init", "Game context: universe=" .. gameContext.universeId .. " place=" .. gameContext.placeId .. " v" .. gameContext.placeVersion)
+					Logger.step("Init", "Game context: projectId=" .. _projectId .. " universe=" .. gameContext.universeId .. " place=" .. gameContext.placeId)
 
 					-- Start auto-sync (handles WebSocket, commands, edits, output)
 					Sync.startAutoSync(function(status: string, msg: string)
@@ -64,27 +90,6 @@ task.spawn(function()
 						-- On disconnect callback — will loop back to discover
 						Logger.step("Init", "Disconnected from IDE, will retry...")
 					end, gameContext)
-
-					-- Watch for game IDs to become available and re-send hello
-					-- This handles both slow PCs and places opened after Studio loads
-					if game.GameId == 0 or game.PlaceId == 0 then
-						task.spawn(function()
-							while _running and APIClient.isConnected() do
-								task.wait(2)
-								if game.GameId ~= 0 or game.PlaceId ~= 0 then
-									local updatedContext = {
-										sessionId = _ephemeralSessionId,
-										universeId = tostring(game.GameId),
-										placeId = tostring(game.PlaceId),
-										placeVersion = tostring(game.PlaceVersion),
-									}
-									Logger.step("Init", "Game IDs now available — re-sending hello: universe=" .. updatedContext.universeId .. " place=" .. updatedContext.placeId)
-									APIClient.wsSendHello(updatedContext)
-									break
-								end
-							end
-						end)
-					end
 				end
 			end)
 

@@ -123,6 +123,8 @@ end
 -- Send plugin_hello with composite session context
 function Client.wsSendHello(context: {
 	sessionId: string,
+	projectId: string?,
+	placeName: string?,
 	universeId: string,
 	placeId: string,
 	placeVersion: string,
@@ -130,6 +132,8 @@ function Client.wsSendHello(context: {
 	local compositeKey = context.universeId .. ":" .. context.placeId .. ":" .. context.sessionId
 	Client.wsSend("plugin_hello", {
 		sessionId = context.sessionId,
+		projectId = context.projectId,
+		placeName = context.placeName,
 		universeId = context.universeId,
 		placeId = context.placeId,
 		placeVersion = context.placeVersion,

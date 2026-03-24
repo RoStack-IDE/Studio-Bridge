@@ -89,24 +89,15 @@ local function objectHash(name: string, className: string, childCount: number): 
 end
 
 -- Optimized scan: passes the already-computed path down to avoid walking up
--- to root for every node. Yields periodically to avoid freezing Studio.
-local _scanCount = 0
-local YIELD_EVERY = 500 -- yield after scanning this many instances
-
+-- to root for every node. Disambiguates siblings with the same name by
+-- appending [2], [3], etc. to the path (Roblox allows duplicate names).
 local function scanAllFast(
 	instance: Instance,
-	parentPath: string,
+	myPath: string,
 	parentId: string?,
 	scripts: { ScriptEntry },
 	objects: { GameObjectEntry }
 )
-	-- Yield periodically to keep Studio responsive
-	_scanCount += 1
-	if _scanCount % YIELD_EVERY == 0 then
-		task.wait()
-	end
-
-	local myPath = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
 	local id = stableId(myPath)
 	local isScript = SCRIPT_CLASSES[instance.ClassName] == true
 
@@ -128,10 +119,31 @@ local function scanAllFast(
 	end
 
 	local children = instance:GetChildren()
-	local childIds: { string } = {}
+
+	-- Detect duplicate names among siblings and disambiguate paths
+	local nameCount: { [string]: number } = {}
 	for _, child in ipairs(children) do
-		local childPath = myPath .. "/" .. child.Name
-		table.insert(childIds, stableId(childPath))
+		nameCount[child.Name] = (nameCount[child.Name] or 0) + 1
+	end
+	local nameIndex: { [string]: number } = {}
+	local childPaths: { string } = {}
+	for i, child in ipairs(children) do
+		local n = child.Name
+		if nameCount[n] > 1 then
+			nameIndex[n] = (nameIndex[n] or 0) + 1
+			if nameIndex[n] == 1 then
+				childPaths[i] = myPath .. "/" .. n
+			else
+				childPaths[i] = myPath .. "/" .. n .. "[" .. tostring(nameIndex[n]) .. "]"
+			end
+		else
+			childPaths[i] = myPath .. "/" .. n
+		end
+	end
+
+	local childIds: { string } = {}
+	for i, _ in ipairs(children) do
+		table.insert(childIds, stableId(childPaths[i]))
 	end
 
 	table.insert(objects, {
@@ -144,8 +156,8 @@ local function scanAllFast(
 		source = source,
 	})
 
-	for _, child in ipairs(children) do
-		scanAllFast(child, myPath, id, scripts, objects)
+	for i, child in ipairs(children) do
+		scanAllFast(child, childPaths[i], id, scripts, objects)
 	end
 end
 
@@ -153,23 +165,19 @@ function Sync.collectAll(): ({ ScriptEntry }, { GameObjectEntry })
 	local scripts: { ScriptEntry } = {}
 	local objects: { GameObjectEntry } = {}
 	for _, root in ipairs(ROOTS) do
-		scanAllFast(root, "", nil, scripts, objects)
+		scanAllFast(root, root.Name, nil, scripts, objects)
 	end
 	return scripts, objects
 end
 
 -- Collect delta: only scripts whose source changed, only objects whose structure changed,
--- plus lists of removed object IDs. Returns nil if nothing changed.
-function Sync.collectDelta(): (
-	{ ScriptEntry }?,      -- changed scripts (nil = no changes)
-	{ GameObjectEntry }?,  -- changed/added objects
-	{ string }?,           -- removed object IDs
-	boolean                -- true if this is a full sync (first time)
-)
+-- plus lists of removed object IDs.
+-- Returns: changedScripts, changedObjects, removedIds, isFull, hasChanges
+function Sync.collectDelta(): ({ ScriptEntry }, { GameObjectEntry }, { string }, boolean, boolean)
 	local allScripts: { ScriptEntry } = {}
 	local allObjects: { GameObjectEntry } = {}
 	for _, root in ipairs(ROOTS) do
-		scanAllFast(root, "", nil, allScripts, allObjects)
+		scanAllFast(root, root.Name, nil, allScripts, allObjects)
 	end
 
 	-- First sync: send everything, populate caches
@@ -187,7 +195,7 @@ function Sync.collectDelta(): (
 				_lastObjectIds[o.id] = true
 			end
 		end
-		return allScripts, allObjects, nil, true
+		return allScripts, allObjects, {}, true, true
 	end
 
 	-- Delta: compare against caches
@@ -233,13 +241,8 @@ function Sync.collectDelta(): (
 	_lastObjectHashes = newObjectHashes
 	_lastObjectIds = currentObjectIds
 
-	-- If nothing changed, return nil
 	local hasChanges = #changedScripts > 0 or #changedObjects > 0 or #removedIds > 0
-	if not hasChanges then
-		return nil, nil, nil, false
-	end
-
-	return changedScripts, changedObjects, removedIds, false
+	return changedScripts, changedObjects, removedIds, false, hasChanges
 end
 
 -- Reset delta state (e.g. on reconnect)
@@ -265,18 +268,32 @@ local function getPath(instance: Instance): string
 	local parts = {}
 	local current: Instance? = instance
 	while current and current ~= game do
-		table.insert(parts, 1, (current :: Instance).Name)
-		current = (current :: Instance).Parent
+		local inst = current :: Instance
+		local name = inst.Name
+		-- Disambiguate siblings with the same name
+		local parent = inst.Parent
+		if parent and parent ~= game then
+			local idx = 0
+			local myIdx = 0
+			for _, sibling in ipairs(parent:GetChildren()) do
+				if sibling.Name == name then
+					idx += 1
+					if sibling == inst then
+						myIdx = idx
+					end
+				end
+			end
+			if idx > 1 and myIdx > 1 then
+				name = name .. "[" .. tostring(myIdx) .. "]"
+			end
+		end
+		table.insert(parts, 1, name)
+		current = inst.Parent
 	end
 	return table.concat(parts, "/")
 end
 
 local function encodeInstance(instance: Instance): EncodedInstance
-	_scanCount += 1
-	if _scanCount % YIELD_EVERY == 0 then
-		task.wait()
-	end
-
 	local children: { EncodedInstance } = {}
 	for _, child in ipairs(instance:GetChildren()) do
 		table.insert(children, encodeInstance(child))
@@ -348,13 +365,13 @@ function Sync.pushToServer()
 		return
 	end
 
-	local scripts, gameObjects, removedIds, isFull = Sync.collectDelta()
+	local scripts, gameObjects, removedIds, isFull, hasChanges = Sync.collectDelta()
 
 	if isFull then
 		-- First sync: send everything using the original sync message
-		APIClient.wsSyncAll(scripts :: { any }, gameObjects :: { any })
-		Logger.log("Sync", string.format("Full sync: %d scripts, %d objects via WS", #(scripts :: { any }), #(gameObjects :: { any })))
-	elseif scripts ~= nil then
+		APIClient.wsSyncAll(scripts, gameObjects)
+		Logger.log("Sync", string.format("Full sync: %d scripts, %d objects via WS", #scripts, #gameObjects))
+	elseif hasChanges then
 		-- Delta sync: send only changes
 		APIClient.wsSend("sync_delta", {
 			scripts = scripts,
@@ -363,13 +380,8 @@ function Sync.pushToServer()
 		})
 		Logger.log("Sync", string.format(
 			"Delta sync: %d scripts, %d objects changed, %d removed",
-			#(scripts :: { any }),
-			#(gameObjects :: { any }),
-			if removedIds then #removedIds else 0
+			#scripts, #gameObjects, #removedIds
 		))
-	else
-		-- Nothing changed, skip the push entirely
-		Logger.log("Sync", "No changes detected, skipping sync")
 	end
 end
 
@@ -506,7 +518,6 @@ local function debouncedPush()
 		task.wait(0.15) -- 150ms debounce
 		_pendingPush = false
 		if _syncRunning then
-			_scanCount = 0
 			pcall(function() Sync.pushToServer() end)
 		end
 	end)
@@ -528,6 +539,7 @@ end
 
 export type GameContext = {
 	sessionId: string,
+	projectId: string?,
 	universeId: string,
 	placeId: string,
 	placeVersion: string,
@@ -628,7 +640,6 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 		while _syncRunning do
 			task.wait(Config.FALLBACK_SYNC_INTERVAL)
 			if not _syncRunning then break end
-			_scanCount = 0 -- reset yield counter
 			local ok, err = pcall(function()
 				Sync.pushToServer()
 			end)
