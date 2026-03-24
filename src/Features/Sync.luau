@@ -88,7 +88,8 @@ local function objectHash(name: string, className: string, childCount: number): 
 	return name .. ":" .. className .. ":" .. tostring(childCount)
 end
 
--- Optimized scan: passes parentPath down to avoid walking up to root for every node
+-- Optimized scan: passes the already-computed path down to avoid walking up
+-- to root for every node.
 local function scanAllFast(
 	instance: Instance,
 	parentPath: string,
@@ -96,8 +97,8 @@ local function scanAllFast(
 	scripts: { ScriptEntry },
 	objects: { GameObjectEntry }
 )
-	local path = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
-	local id = stableId(path)
+	local myPath = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
+	local id = stableId(myPath)
 	local isScript = SCRIPT_CLASSES[instance.ClassName] == true
 
 	local source: string? = nil
@@ -109,7 +110,7 @@ local function scanAllFast(
 			source = src
 			table.insert(scripts, {
 				name = instance.Name,
-				path = path,
+				path = myPath,
 				source = src,
 				className = instance.ClassName,
 				guid = id,
@@ -117,10 +118,10 @@ local function scanAllFast(
 		end
 	end
 
-	local childIds: { string } = {}
 	local children = instance:GetChildren()
+	local childIds: { string } = {}
 	for _, child in ipairs(children) do
-		local childPath = path .. "/" .. child.Name
+		local childPath = myPath .. "/" .. child.Name
 		table.insert(childIds, stableId(childPath))
 	end
 
@@ -128,14 +129,14 @@ local function scanAllFast(
 		id = id,
 		name = instance.Name,
 		type = instance.ClassName,
-		path = path,
+		path = myPath,
 		parentId = parentId,
 		children = childIds,
 		source = source,
 	})
 
 	for _, child in ipairs(children) do
-		scanAllFast(child, path, id, scripts, objects)
+		scanAllFast(child, myPath, id, scripts, objects)
 	end
 end
 
@@ -165,13 +166,17 @@ function Sync.collectDelta(): (
 	-- First sync: send everything, populate caches
 	if not _hasSentFullSync then
 		_hasSentFullSync = true
-		-- Populate caches
+		-- Populate caches (first-seen wins for duplicate IDs)
 		for _, s in ipairs(allScripts) do
-			_lastScriptHashes[s.guid] = quickHash(s.source)
+			if not _lastScriptHashes[s.guid] then
+				_lastScriptHashes[s.guid] = quickHash(s.source)
+			end
 		end
 		for _, o in ipairs(allObjects) do
-			_lastObjectHashes[o.id] = objectHash(o.name, o.type, #o.children)
-			_lastObjectIds[o.id] = true
+			if not _lastObjectIds[o.id] then
+				_lastObjectHashes[o.id] = objectHash(o.name, o.type, #o.children)
+				_lastObjectIds[o.id] = true
+			end
 		end
 		return allScripts, allObjects, nil, true
 	end
@@ -181,28 +186,28 @@ function Sync.collectDelta(): (
 	local changedObjects: { GameObjectEntry } = {}
 	local currentObjectIds: { [string]: boolean } = {}
 
-	-- Build new script hash map
+	-- Build new script hash map (first-seen wins for duplicate IDs)
 	local newScriptHashes: { [string]: string } = {}
 	for _, s in ipairs(allScripts) do
-		local h = quickHash(s.source)
-		newScriptHashes[s.guid] = h
-		if _lastScriptHashes[s.guid] ~= h then
-			table.insert(changedScripts, s)
+		if not newScriptHashes[s.guid] then
+			local h = quickHash(s.source)
+			newScriptHashes[s.guid] = h
+			if _lastScriptHashes[s.guid] ~= h then
+				table.insert(changedScripts, s)
+			end
 		end
 	end
 
-	-- Check for removed scripts (script that was in old but not in new)
-	-- Scripts are a subset of objects, so removals are handled by object removal
-
-	-- Build new object hash map and detect changes
+	-- Build new object hash map and detect changes (first-seen wins for duplicate IDs)
 	local newObjectHashes: { [string]: string } = {}
 	for _, o in ipairs(allObjects) do
-		currentObjectIds[o.id] = true
-		local h = objectHash(o.name, o.type, #o.children)
-		newObjectHashes[o.id] = h
-		if _lastObjectHashes[o.id] ~= h then
-			-- Object is new or changed
-			table.insert(changedObjects, o)
+		if not currentObjectIds[o.id] then
+			currentObjectIds[o.id] = true
+			local h = objectHash(o.name, o.type, #o.children)
+			newObjectHashes[o.id] = h
+			if _lastObjectHashes[o.id] ~= h then
+				table.insert(changedObjects, o)
+			end
 		end
 	end
 
