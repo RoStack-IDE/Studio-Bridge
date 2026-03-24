@@ -1,0 +1,11 @@
+# Wally-installed packages (committed per-project but typically gitignored for templates)
+Packages/
+
+# Rojo build output
+build/
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+.DS_Store
