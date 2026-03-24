@@ -80,9 +80,12 @@ local function quickHash(s: string): string
 		.. string.byte(s, len)
 end
 
--- Hash an object's structure (name + type + children list) without source
-local function objectHash(name: string, className: string, childIds: { string }): string
-	return name .. ":" .. className .. ":" .. table.concat(childIds, ",")
+-- Hash an object's structure (name + type + children count) without source.
+-- We use child count instead of the full list because GetChildren() order
+-- is not stable in Roblox — sorting 21K child lists every tick is wasteful.
+-- Count changes reliably detect adds/removes, and name/type catch renames.
+local function objectHash(name: string, className: string, childCount: number): string
+	return name .. ":" .. className .. ":" .. tostring(childCount)
 end
 
 -- Optimized scan: passes parentPath down to avoid walking up to root for every node
@@ -167,7 +170,7 @@ function Sync.collectDelta(): (
 			_lastScriptHashes[s.guid] = quickHash(s.source)
 		end
 		for _, o in ipairs(allObjects) do
-			_lastObjectHashes[o.id] = objectHash(o.name, o.type, o.children)
+			_lastObjectHashes[o.id] = objectHash(o.name, o.type, #o.children)
 			_lastObjectIds[o.id] = true
 		end
 		return allScripts, allObjects, nil, true
@@ -195,7 +198,7 @@ function Sync.collectDelta(): (
 	local newObjectHashes: { [string]: string } = {}
 	for _, o in ipairs(allObjects) do
 		currentObjectIds[o.id] = true
-		local h = objectHash(o.name, o.type, o.children)
+		local h = objectHash(o.name, o.type, #o.children)
 		newObjectHashes[o.id] = h
 		if _lastObjectHashes[o.id] ~= h then
 			-- Object is new or changed
