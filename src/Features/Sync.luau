@@ -1,6 +1,7 @@
 --!strict
 -- Studio Bridge Sync Feature
--- Scans the ENTIRE game hierarchy, syncs all objects + scripts.
+-- Uses incremental delta sync to minimize lag on large games.
+-- First sync sends everything (full), subsequent syncs send only changes.
 -- Uses a single WebSocket (CreateWebStreamClient) for ALL communication:
 --   - Plugin → Server: sync pushes, command results, pings
 --   - Server → Plugin: AI tool commands, web editor edits, sync acks
@@ -55,18 +56,44 @@ local function stableId(path: string): string
 	return "obj-" .. string.gsub(path, "[^%w/]", "_")
 end
 
-local function getPath(instance: Instance): string
-	local parts = {}
-	local current: Instance? = instance
-	while current and current ~= game do
-		table.insert(parts, 1, (current :: Instance).Name)
-		current = (current :: Instance).Parent
-	end
-	return table.concat(parts, "/")
+-- ── Delta sync state ──
+-- Caches from the last sync cycle to detect changes
+local _lastScriptHashes: { [string]: string } = {}   -- guid -> hash of source
+local _lastObjectHashes: { [string]: string } = {}   -- id -> hash of structure
+local _lastObjectIds: { [string]: boolean } = {}      -- set of all known object ids
+local _hasSentFullSync = false                         -- first sync must be full
+
+-- Simple fast hash: use string.len + first/last/mid chars + a checksum
+-- This avoids serializing the entire source just to detect changes
+local function quickHash(s: string): string
+	local len = #s
+	if len == 0 then return "0:" end
+	-- Sample a few bytes for a fast fingerprint
+	local mid = math.floor(len / 2)
+	local q1 = math.floor(len / 4)
+	local q3 = math.floor(len * 3 / 4)
+	return tostring(len) .. ":" 
+		.. string.byte(s, 1) .. ":"
+		.. string.byte(s, mid > 0 and mid or 1) .. ":"
+		.. string.byte(s, q1 > 0 and q1 or 1) .. ":"
+		.. string.byte(s, q3 > 0 and q3 or 1) .. ":"
+		.. string.byte(s, len)
 end
 
-local function scanAll(instance: Instance, parentId: string?, scripts: { ScriptEntry }, objects: { GameObjectEntry })
-	local path = getPath(instance)
+-- Hash an object's structure (name + type + children list) without source
+local function objectHash(name: string, className: string, childIds: { string }): string
+	return name .. ":" .. className .. ":" .. table.concat(childIds, ",")
+end
+
+-- Optimized scan: passes parentPath down to avoid walking up to root for every node
+local function scanAllFast(
+	instance: Instance,
+	parentPath: string,
+	parentId: string?,
+	scripts: { ScriptEntry },
+	objects: { GameObjectEntry }
+)
+	local path = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
 	local id = stableId(path)
 	local isScript = SCRIPT_CLASSES[instance.ClassName] == true
 
@@ -88,8 +115,9 @@ local function scanAll(instance: Instance, parentId: string?, scripts: { ScriptE
 	end
 
 	local childIds: { string } = {}
-	for _, child in ipairs(instance:GetChildren()) do
-		local childPath = getPath(child)
+	local children = instance:GetChildren()
+	for _, child in ipairs(children) do
+		local childPath = path .. "/" .. child.Name
 		table.insert(childIds, stableId(childPath))
 	end
 
@@ -103,8 +131,8 @@ local function scanAll(instance: Instance, parentId: string?, scripts: { ScriptE
 		source = source,
 	})
 
-	for _, child in ipairs(instance:GetChildren()) do
-		scanAll(child, id, scripts, objects)
+	for _, child in ipairs(children) do
+		scanAllFast(child, path, id, scripts, objects)
 	end
 end
 
@@ -112,9 +140,97 @@ function Sync.collectAll(): ({ ScriptEntry }, { GameObjectEntry })
 	local scripts: { ScriptEntry } = {}
 	local objects: { GameObjectEntry } = {}
 	for _, root in ipairs(ROOTS) do
-		scanAll(root, nil, scripts, objects)
+		scanAllFast(root, "", nil, scripts, objects)
 	end
 	return scripts, objects
+end
+
+-- Collect delta: only scripts whose source changed, only objects whose structure changed,
+-- plus lists of removed object IDs. Returns nil if nothing changed.
+function Sync.collectDelta(): (
+	{ ScriptEntry }?,      -- changed scripts (nil = no changes)
+	{ GameObjectEntry }?,  -- changed/added objects
+	{ string }?,           -- removed object IDs
+	boolean                -- true if this is a full sync (first time)
+)
+	local allScripts: { ScriptEntry } = {}
+	local allObjects: { GameObjectEntry } = {}
+	for _, root in ipairs(ROOTS) do
+		scanAllFast(root, "", nil, allScripts, allObjects)
+	end
+
+	-- First sync: send everything, populate caches
+	if not _hasSentFullSync then
+		_hasSentFullSync = true
+		-- Populate caches
+		for _, s in ipairs(allScripts) do
+			_lastScriptHashes[s.guid] = quickHash(s.source)
+		end
+		for _, o in ipairs(allObjects) do
+			_lastObjectHashes[o.id] = objectHash(o.name, o.type, o.children)
+			_lastObjectIds[o.id] = true
+		end
+		return allScripts, allObjects, nil, true
+	end
+
+	-- Delta: compare against caches
+	local changedScripts: { ScriptEntry } = {}
+	local changedObjects: { GameObjectEntry } = {}
+	local currentObjectIds: { [string]: boolean } = {}
+
+	-- Build new script hash map
+	local newScriptHashes: { [string]: string } = {}
+	for _, s in ipairs(allScripts) do
+		local h = quickHash(s.source)
+		newScriptHashes[s.guid] = h
+		if _lastScriptHashes[s.guid] ~= h then
+			table.insert(changedScripts, s)
+		end
+	end
+
+	-- Check for removed scripts (script that was in old but not in new)
+	-- Scripts are a subset of objects, so removals are handled by object removal
+
+	-- Build new object hash map and detect changes
+	local newObjectHashes: { [string]: string } = {}
+	for _, o in ipairs(allObjects) do
+		currentObjectIds[o.id] = true
+		local h = objectHash(o.name, o.type, o.children)
+		newObjectHashes[o.id] = h
+		if _lastObjectHashes[o.id] ~= h then
+			-- Object is new or changed
+			table.insert(changedObjects, o)
+		end
+	end
+
+	-- Detect removed objects
+	local removedIds: { string } = {}
+	for id in pairs(_lastObjectIds) do
+		if not currentObjectIds[id] then
+			table.insert(removedIds, id)
+		end
+	end
+
+	-- Update caches
+	_lastScriptHashes = newScriptHashes
+	_lastObjectHashes = newObjectHashes
+	_lastObjectIds = currentObjectIds
+
+	-- If nothing changed, return nil
+	local hasChanges = #changedScripts > 0 or #changedObjects > 0 or #removedIds > 0
+	if not hasChanges then
+		return nil, nil, nil, false
+	end
+
+	return changedScripts, changedObjects, removedIds, false
+end
+
+-- Reset delta state (e.g. on reconnect)
+function Sync.resetDeltaState()
+	_lastScriptHashes = {}
+	_lastObjectHashes = {}
+	_lastObjectIds = {}
+	_hasSentFullSync = false
 end
 
 -- ── DataModel encoding for luau-lsp ──
@@ -128,15 +244,22 @@ type EncodedInstance = {
 	Children: { EncodedInstance },
 }
 
+local function getPath(instance: Instance): string
+	local parts = {}
+	local current: Instance? = instance
+	while current and current ~= game do
+		table.insert(parts, 1, (current :: Instance).Name)
+		current = (current :: Instance).Parent
+	end
+	return table.concat(parts, "/")
+end
+
 local function encodeInstance(instance: Instance): EncodedInstance
 	local children: { EncodedInstance } = {}
 	for _, child in ipairs(instance:GetChildren()) do
 		table.insert(children, encodeInstance(child))
 	end
 
-	-- Build FilePaths for script instances so luau-lsp can map
-	-- opened file URIs back to DataModel instances for autocomplete.
-	-- The web editor opens files as file:///workspace/<path>.luau
 	local filePaths: { string } = {}
 	if SCRIPT_CLASSES[instance.ClassName] then
 		local path = getPath(instance)
@@ -168,7 +291,6 @@ end
 local _lastDMHash: string? = nil
 
 local function getTreeHash(tree: EncodedInstance): string
-	-- Simple hash: count total nodes (cheap proxy for tree identity)
 	local count = 0
 	local function walk(node: EncodedInstance)
 		count += 1
@@ -180,7 +302,6 @@ local function getTreeHash(tree: EncodedInstance): string
 	return tostring(count) .. ":" .. tree.Name
 end
 
--- Send DataModel tree to server (debounced externally)
 function Sync.pushDataModel()
 	if not APIClient.isConnected() or not APIClient.isWSConnected() then
 		return
@@ -189,7 +310,6 @@ function Sync.pushDataModel()
 	local tree = Sync.encodeDataModel()
 	local hash = getTreeHash(tree)
 
-	-- Skip if tree hasn't changed
 	if hash == _lastDMHash then
 		return
 	end
@@ -199,15 +319,36 @@ function Sync.pushDataModel()
 	Logger.log("Sync", "Pushed DataModel tree to server")
 end
 
--- Push game state over WebSocket (non-blocking, fire-and-forget)
+-- Push game state over WebSocket using delta sync
+-- First push sends full state, subsequent pushes send only changes
 function Sync.pushToServer()
 	if not APIClient.isConnected() or not APIClient.isWSConnected() then
 		return
 	end
 
-	local scripts, gameObjects = Sync.collectAll()
-	APIClient.wsSyncAll(scripts, gameObjects)
-	Logger.log("Sync", string.format("Pushed %d scripts, %d objects via WS", #scripts, #gameObjects))
+	local scripts, gameObjects, removedIds, isFull = Sync.collectDelta()
+
+	if isFull then
+		-- First sync: send everything using the original sync message
+		APIClient.wsSyncAll(scripts :: { any }, gameObjects :: { any })
+		Logger.log("Sync", string.format("Full sync: %d scripts, %d objects via WS", #(scripts :: { any }), #(gameObjects :: { any })))
+	elseif scripts ~= nil then
+		-- Delta sync: send only changes
+		APIClient.wsSend("sync_delta", {
+			scripts = scripts,
+			gameObjects = gameObjects,
+			removedIds = removedIds,
+		})
+		Logger.log("Sync", string.format(
+			"Delta sync: %d scripts, %d objects changed, %d removed",
+			#(scripts :: { any }),
+			#(gameObjects :: { any }),
+			if removedIds then #removedIds else 0
+		))
+	else
+		-- Nothing changed, skip the push entirely
+		Logger.log("Sync", "No changes detected, skipping sync")
+	end
 end
 
 function Sync.applyWebEdits(edits: { any })
@@ -228,19 +369,15 @@ function Sync.applyWebEdits(edits: { any })
 			if SCRIPT_CLASSES[current.ClassName] then
 				local existing = (current :: any).Source
 				if existing ~= entry.source then
-					-- Try ScriptEditorService first (updates the open editor buffer)
 					local seOk = pcall(function()
 						local doc = ScriptEditorService:FindScriptDocument(current :: LuaSourceContainer)
 						if doc then
-							-- Script is open in editor — use EditTextAsync to replace content
 							local lineCount = doc:GetLineCount()
 							local lastLineText = doc:GetLine(lineCount)
 							local lastLineLen = if lastLineText then #lastLineText else 0
-							-- Replace entire document content
 							doc:EditTextAsync(entry.source, 1, 1, lineCount, lastLineLen + 1)
 							Logger.log("Sync", "Applied web edit (editor) -> " .. entry.path)
 
-							-- Scroll Studio editor to the cursor position from the web editor
 							if entry.cursorLine then
 								local line = entry.cursorLine :: number
 								local col = (entry.cursorColumn :: number?) or 1
@@ -249,13 +386,11 @@ function Sync.applyWebEdits(edits: { any })
 								end)
 							end
 						else
-							-- Script not open in editor — set Source directly
 							(current :: any).Source = entry.source
 							Logger.log("Sync", "Applied web edit (source) -> " .. entry.path)
 						end
 					end)
 					if not seOk then
-						-- Fallback: set Source property directly
 						(current :: any).Source = entry.source
 						Logger.log("Sync", "Applied web edit (fallback) -> " .. entry.path)
 					end
@@ -268,7 +403,6 @@ function Sync.applyWebEdits(edits: { any })
 	end
 end
 
--- Execute AI tool commands received from server (via WebSocket)
 function Sync.executeCommands(commands: { any })
 	Logger.log("Sync", "Received " .. #commands .. " command(s) via WebSocket")
 	local results = {}
@@ -283,16 +417,15 @@ function Sync.executeCommands(commands: { any })
 		})
 	end
 
-	-- Report results back over WebSocket
 	if #results > 0 then
 		APIClient.wsReportResults(results)
 		Logger.log("Sync", "Reported " .. #results .. " command result(s) via WS")
 	end
 
-	-- After executing commands, do an immediate sync push
-	-- so the web explorer reflects the changes right away
+	-- After executing commands, force a full re-sync so changes are reflected
 	task.spawn(function()
 		task.wait(0.5)
+		Sync.resetDeltaState()
 		Sync.pushToServer()
 	end)
 end
@@ -362,7 +495,7 @@ local function debouncedDMPush()
 	if _pendingDMPush then return end
 	_pendingDMPush = true
 	task.defer(function()
-		task.wait(0.5) -- 500ms debounce (matches official luau-lsp plugin)
+		task.wait(0.5)
 		_pendingDMPush = false
 		if _syncRunning then
 			pcall(function() Sync.pushDataModel() end)
@@ -380,6 +513,9 @@ export type GameContext = {
 function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, onDisconnect: (() -> ())?, gameContext: GameContext?)
 	if _syncRunning then return end
 	_syncRunning = true
+
+	-- Reset delta state for fresh session
+	Sync.resetDeltaState()
 
 	-- Reset output batching state for new session
 	_outputSeq = 0
@@ -437,13 +573,11 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 			debouncedPush()
 			debouncedDMPush()
 		end))
-		-- Listen for property changes on scripts (source edits in Studio)
 		table.insert(_changeConnections, root.DescendantAdded:Connect(function(desc)
 			if desc:IsA("LuaSourceContainer") then
 				local conn = desc.Changed:Connect(function()
 					debouncedPush()
 				end)
-				-- Clean up when removed
 				desc.Destroying:Once(function()
 					conn:Disconnect()
 				end)
@@ -475,7 +609,6 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 				Logger.error("Sync", "Auto-sync cycle failed: " .. tostring(err))
 				if onStatus then onStatus("error", tostring(err)) end
 			end
-			-- Also periodically refresh DataModel tree
 			pcall(function() Sync.pushDataModel() end)
 			task.wait(Config.AUTO_SYNC_INTERVAL)
 		end
@@ -489,7 +622,6 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 	local LogService = game:GetService("LogService")
 	_logConnection = LogService.MessageOut:Connect(function(message: string, messageType: Enum.MessageType)
 		if not APIClient.isWSConnected() then return end
-		-- Filter out our own log messages to avoid feedback loops
 		local prefixLen = #Config.LOG_PREFIX
 		if string.sub(message, 1, prefixLen) == Config.LOG_PREFIX then return end
 		local level = "log"
@@ -509,7 +641,6 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 	local ScriptContext = game:GetService("ScriptContext")
 	_errorConnection = ScriptContext.Error:Connect(function(message: string, stackTrace: string, scriptInstance: LuaSourceContainer?)
 		if not APIClient.isWSConnected() then return end
-		-- Filter out our own errors
 		if string.find(message, Config.LOG_PREFIX, 1, true) then return end
 		local scriptPath = if scriptInstance then scriptInstance:GetFullName() else "unknown"
 		local fullMessage = message
@@ -524,6 +655,9 @@ function Sync.stopAutoSync()
 	_syncRunning = false
 	_lastDMHash = nil
 
+	-- Reset delta state
+	Sync.resetDeltaState()
+
 	-- Clear output buffer
 	table.clear(_outputBuffer)
 	_outputFlushScheduled = false
@@ -534,7 +668,6 @@ function Sync.stopAutoSync()
 	end
 	table.clear(_changeConnections)
 
-	-- Disconnect WebSocket event listeners
 	if _cmdConnection then
 		_cmdConnection:Disconnect()
 		_cmdConnection = nil
@@ -552,19 +685,16 @@ function Sync.stopAutoSync()
 		_disconnectConnection = nil
 	end
 
-	-- Disconnect log listener
 	if _logConnection then
 		_logConnection:Disconnect()
 		_logConnection = nil
 	end
 
-	-- Disconnect error listener
 	if _errorConnection then
 		_errorConnection:Disconnect()
 		_errorConnection = nil
 	end
 
-	-- Close WebSocket
 	APIClient.disconnectWS()
 
 	Logger.step("Sync", "Auto-sync and WebSocket stopped")

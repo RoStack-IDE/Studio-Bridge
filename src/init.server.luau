@@ -45,6 +45,8 @@ task.spawn(function()
 					Logger.step("Init", "Session found! ID=" .. tostring(data.sessionId))
 
 					-- Build composite session context from game metadata
+					-- IDs may be 0 initially (Studio loads them async) — we'll re-send
+					-- plugin_hello once they become available
 					local gameContext = {
 						sessionId = _ephemeralSessionId,
 						universeId = tostring(game.GameId),
@@ -62,6 +64,27 @@ task.spawn(function()
 						-- On disconnect callback — will loop back to discover
 						Logger.step("Init", "Disconnected from IDE, will retry...")
 					end, gameContext)
+
+					-- Watch for game IDs to become available and re-send hello
+					-- This handles both slow PCs and places opened after Studio loads
+					if game.GameId == 0 or game.PlaceId == 0 then
+						task.spawn(function()
+							while _running and APIClient.isConnected() do
+								task.wait(2)
+								if game.GameId ~= 0 or game.PlaceId ~= 0 then
+									local updatedContext = {
+										sessionId = _ephemeralSessionId,
+										universeId = tostring(game.GameId),
+										placeId = tostring(game.PlaceId),
+										placeVersion = tostring(game.PlaceVersion),
+									}
+									Logger.step("Init", "Game IDs now available — re-sending hello: universe=" .. updatedContext.universeId .. " place=" .. updatedContext.placeId)
+									APIClient.wsSendHello(updatedContext)
+									break
+								end
+							end
+						end)
+					end
 				end
 			end)
 
