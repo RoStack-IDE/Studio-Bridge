@@ -89,7 +89,10 @@ local function objectHash(name: string, className: string, childCount: number): 
 end
 
 -- Optimized scan: passes the already-computed path down to avoid walking up
--- to root for every node.
+-- to root for every node. Yields periodically to avoid freezing Studio.
+local _scanCount = 0
+local YIELD_EVERY = 500 -- yield after scanning this many instances
+
 local function scanAllFast(
 	instance: Instance,
 	parentPath: string,
@@ -97,6 +100,12 @@ local function scanAllFast(
 	scripts: { ScriptEntry },
 	objects: { GameObjectEntry }
 )
+	-- Yield periodically to keep Studio responsive
+	_scanCount += 1
+	if _scanCount % YIELD_EVERY == 0 then
+		task.wait()
+	end
+
 	local myPath = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
 	local id = stableId(myPath)
 	local isScript = SCRIPT_CLASSES[instance.ClassName] == true
@@ -263,6 +272,11 @@ local function getPath(instance: Instance): string
 end
 
 local function encodeInstance(instance: Instance): EncodedInstance
+	_scanCount += 1
+	if _scanCount % YIELD_EVERY == 0 then
+		task.wait()
+	end
+
 	local children: { EncodedInstance } = {}
 	for _, child in ipairs(instance:GetChildren()) do
 		table.insert(children, encodeInstance(child))
@@ -492,6 +506,7 @@ local function debouncedPush()
 		task.wait(0.15) -- 150ms debounce
 		_pendingPush = false
 		if _syncRunning then
+			_scanCount = 0
 			pcall(function() Sync.pushToServer() end)
 		end
 	end)
@@ -607,9 +622,13 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 		end
 	end
 
-	-- Fallback periodic sync (catches anything the events miss)
+	-- Fallback periodic sync — safety net only, events handle real-time changes.
+	-- Runs at a much longer interval to avoid lagging Studio on large games.
 	task.spawn(function()
 		while _syncRunning do
+			task.wait(Config.FALLBACK_SYNC_INTERVAL)
+			if not _syncRunning then break end
+			_scanCount = 0 -- reset yield counter
 			local ok, err = pcall(function()
 				Sync.pushToServer()
 			end)
@@ -618,7 +637,6 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 				if onStatus then onStatus("error", tostring(err)) end
 			end
 			pcall(function() Sync.pushDataModel() end)
-			task.wait(Config.AUTO_SYNC_INTERVAL)
 		end
 	end)
 
