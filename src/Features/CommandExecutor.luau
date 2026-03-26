@@ -1082,6 +1082,66 @@ end
 
 -- ── Public API for registering custom command handlers ──
 
+-- ═══════════════════════════════════════════════════════════
+-- RUN CODE (execute arbitrary Luau in the plugin context)
+-- ═══════════════════════════════════════════════════════════
+
+handlers["runCode"] = function(params)
+	local code = params.code :: string
+	if not code or code == "" then error("No code provided") end
+
+	local fn, compileErr = loadstring(code)
+	if not fn then
+		error("Compile error: " .. tostring(compileErr))
+	end
+
+	local ok, result = pcall(fn)
+	if not ok then
+		error("Runtime error: " .. tostring(result))
+	end
+
+	return { executed = true, result = if result ~= nil then tostring(result) else nil }
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- PACKAGE INSTALLATION (handled via batch commands from desktop)
+-- The desktop parses .rbxmx files and sends createInstance/insertScript
+-- commands as a batch. This handler is a fallback for direct asset ID installs.
+-- ═══════════════════════════════════════════════════════════
+
+handlers["installPackage"] = function(params)
+	return withRecording("Install package " .. tostring(params.package), function()
+		local packageName = params.package :: string
+		if not packageName or packageName == "" then error("No package name provided") end
+
+		local parentPath = (params.parentPath :: string?) or "ReplicatedStorage"
+		local parent = resolveInstance(parentPath)
+		if not parent then error("Parent not found: " .. parentPath) end
+
+		-- Check if already installed
+		local existing = parent:FindFirstChild(packageName)
+		if existing then
+			return { installed = false, alreadyExists = true, message = packageName .. " is already installed in " .. parentPath, path = getPath(existing) }
+		end
+
+		-- If an asset ID is provided, use InsertService directly
+		local assetId = params.assetId :: number?
+		if assetId and assetId > 0 then
+			local model = InsertService:LoadAsset(assetId)
+			local children = model:GetChildren()
+			local installed = {}
+			for _, child in children do
+				child.Parent = parent
+				table.insert(installed, { name = child.Name, className = child.ClassName, path = getPath(child) })
+			end
+			model:Destroy()
+			return { installed = true, package = packageName, parentPath = parentPath, children = installed, count = #installed }
+		end
+
+		error("Package installation should be handled via batch commands from the desktop app.")
+	end)
+end
+
 function CommandExecutor.registerHandler(commandType: string, handler: (params: { [string]: any }) -> any)
 	if handlers[commandType] then
 		Logger.warn("CommandExecutor", "Overwriting handler for: " .. commandType)

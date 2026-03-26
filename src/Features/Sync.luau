@@ -660,7 +660,12 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 	_logConnection = LogService.MessageOut:Connect(function(message: string, messageType: Enum.MessageType)
 		if not APIClient.isWSConnected() then return end
 		local prefixLen = #Config.LOG_PREFIX
-		if string.sub(message, 1, prefixLen) == Config.LOG_PREFIX then return end
+		-- Skip internal plugin debug logs, but forward warnings and errors
+		if string.sub(message, 1, prefixLen) == Config.LOG_PREFIX then
+			if messageType == Enum.MessageType.MessageOutput then return end
+			-- Strip the [Plugin] prefix for cleaner display
+			message = string.sub(message, prefixLen + 2)
+		end
 		local level = "log"
 		if messageType == Enum.MessageType.MessageError then
 			level = "error"
