@@ -15,6 +15,7 @@ local TweenService = game:GetService("TweenService")
 local Logger = require(script.Parent.Parent.Logger)
 local Config = require(script.Parent.Parent.Config)
 local DataTypeSerializer = require(script.Parent.DataTypeSerializer)
+local RbxDom = require(script.Parent.Parent.RbxDom)
 
 local CommandExecutor = {}
 
@@ -1078,6 +1079,464 @@ handlers["showSessionHighlight"] = function(_params)
 	end)
 
 	return { shown = true }
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- GLOB: Find instances matching a glob-like pattern
+-- ═══════════════════════════════════════════════════════════
+
+handlers["glob"] = function(params)
+	local pattern = params.pattern :: string
+	if not pattern or pattern == "" then error("No pattern provided") end
+	local classFilter = params.classFilter :: string?
+	local maxResults = math.min((params.maxResults :: number?) or Config.MAX_SEARCH_RESULTS, Config.MAX_SEARCH_RESULTS)
+
+	-- Convert glob pattern to Lua pattern:
+	-- "*" → "[^/]*" (match within one level)
+	-- "**" → ".*" (match across levels)
+	-- "?" → "." (single char)
+	local luaPattern = pattern
+	luaPattern = string.gsub(luaPattern, "%*%*", "\1") -- placeholder for **
+	luaPattern = string.gsub(luaPattern, "%*", "[^%.]*")
+	luaPattern = string.gsub(luaPattern, "\1", ".*")
+	luaPattern = string.gsub(luaPattern, "%?", ".")
+
+	local matches = {}
+	local ROOTS = {
+		game:GetService("ServerScriptService"),
+		game:GetService("ReplicatedStorage"),
+		game:GetService("ReplicatedFirst"),
+		game:GetService("StarterPlayer"),
+		game:GetService("StarterGui"),
+		game:GetService("StarterPack"),
+		game:GetService("ServerStorage"),
+		game:GetService("Workspace"),
+		game:GetService("Lighting"),
+	}
+
+	for _, root in ROOTS do
+		if #matches >= maxResults then break end
+		for _, desc in root:GetDescendants() do
+			if #matches >= maxResults then break end
+			local path = getPath(desc)
+			local nameMatch = pcall(function() return string.find(path, luaPattern) end)
+			if nameMatch then
+				local ok, found = pcall(function() return string.find(path, luaPattern) end)
+				if ok and found then
+					if not classFilter or desc.ClassName == classFilter then
+						table.insert(matches, {
+							name = desc.Name,
+							className = desc.ClassName,
+							path = path,
+							hasChildren = #desc:GetChildren() > 0,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	return {
+		matches = matches,
+		totalFound = #matches,
+		truncated = #matches >= maxResults,
+	}
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- GREP: Search script source code for text or Lua patterns
+-- ═══════════════════════════════════════════════════════════
+
+handlers["grep"] = function(params)
+	local query = params.query :: string
+	if not query or query == "" then error("No query provided") end
+	local isPattern = (params.isPattern :: boolean?) or false
+	local ignoreCase = (params.ignoreCase :: boolean?) or true
+	local maxResults = math.min((params.maxResults :: number?) or Config.MAX_SEARCH_RESULTS, Config.MAX_SEARCH_RESULTS)
+	local scriptClassFilter = params.scriptClassFilter :: string?
+
+	local SCRIPT_CLASSES = { Script = true, LocalScript = true, ModuleScript = true }
+	local matches = {}
+
+	local ROOTS = {
+		game:GetService("ServerScriptService"),
+		game:GetService("ReplicatedStorage"),
+		game:GetService("ReplicatedFirst"),
+		game:GetService("StarterPlayer"),
+		game:GetService("StarterGui"),
+		game:GetService("StarterPack"),
+		game:GetService("ServerStorage"),
+		game:GetService("Workspace"),
+	}
+
+	local searchQuery = query
+	if ignoreCase and not isPattern then
+		searchQuery = string.lower(query)
+	end
+
+	for _, root in ROOTS do
+		if #matches >= maxResults then break end
+		for _, desc in root:GetDescendants() do
+			if #matches >= maxResults then break end
+			if not SCRIPT_CLASSES[desc.ClassName] then continue end
+			if scriptClassFilter and desc.ClassName ~= scriptClassFilter then continue end
+
+			local ok, source = pcall(function() return (desc :: any).Source end)
+			if not ok or not source or source == "" then continue end
+
+			local lines = string.split(source, "\n")
+			for lineNum, line in lines do
+				if #matches >= maxResults then break end
+				local found = false
+				if isPattern then
+					found = pcall(function() return string.find(line, query) end) and string.find(line, query) ~= nil
+				else
+					local searchLine = if ignoreCase then string.lower(line) else line
+					found = string.find(searchLine, searchQuery, 1, true) ~= nil
+				end
+				if found then
+					table.insert(matches, {
+						name = desc.Name,
+						className = desc.ClassName,
+						path = getPath(desc),
+						lineNumber = lineNum,
+						matchText = string.sub(line, 1, 200), -- truncate long lines
+					})
+				end
+			end
+		end
+	end
+
+	return {
+		matches = matches,
+		totalFound = #matches,
+		truncated = #matches >= maxResults,
+	}
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- RUN TESTS: Execute game simulation and capture errors
+-- ═══════════════════════════════════════════════════════════
+
+handlers["runTests"] = function(params)
+	local RunService = game:GetService("RunService")
+	local LogService = game:GetService("LogService")
+
+	local timeout = math.min((params.timeout :: number?) or 10, Config.MAX_TEST_TIMEOUT)
+	local errors = {}
+	local messages = {}
+
+	-- Connect to LogService to capture errors in real-time
+	local connection = LogService.MessageOut:Connect(function(message: string, messageType: Enum.MessageType)
+		-- Skip our own log messages to prevent recursion
+		if string.find(message, Config.LOG_PREFIX, 1, true) then return end
+
+		if messageType == Enum.MessageType.MessageError or messageType == Enum.MessageType.MessageWarning then
+			-- Parse script path and line number from error message
+			local scriptPath = string.match(message, "([%w%.]+):%d+:") or "Unknown"
+			scriptPath = string.gsub(scriptPath, "%.", "/")
+			local lineNum = tonumber(string.match(message, ":(%d+):"))
+
+			table.insert(errors, {
+				scriptPath = scriptPath,
+				lineNumber = lineNum,
+				message = message,
+			})
+		elseif messageType == Enum.MessageType.MessageInfo or messageType == Enum.MessageType.MessageOutput then
+			table.insert(messages, message)
+		end
+	end)
+
+	-- Start game simulation
+	local startTime = os.clock()
+	local startOk, startErr = pcall(function()
+		RunService:Run()
+	end)
+
+	if not startOk then
+		connection:Disconnect()
+		return {
+			success = false,
+			error = "Failed to start game simulation: " .. tostring(startErr),
+		}
+	end
+
+	-- Wait for timeout
+	task.wait(timeout)
+
+	-- Stop simulation
+	pcall(function() RunService:Stop() end)
+
+	local duration = math.floor((os.clock() - startTime) * 1000)
+	connection:Disconnect()
+
+	return {
+		success = true,
+		totalTests = 1,
+		passedTests = if #errors == 0 then 1 else 0,
+		failedTests = if #errors > 0 then 1 else 0,
+		errors = errors,
+		messages = messages,
+		duration = duration,
+	}
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- IMPORT TOOLBOX ASSET: Import Roblox asset by ID
+-- ═══════════════════════════════════════════════════════════
+
+handlers["importToolboxAsset"] = function(params)
+	return withRecording("Import toolbox asset", function()
+		local parentPath = params.parentPath :: string
+		local parent = resolveInstance(parentPath)
+		if not parent then error("Parent not found: " .. parentPath) end
+
+		local assetId = params.assetId :: number
+		if not assetId or assetId <= 0 then error("Invalid assetId: " .. tostring(assetId)) end
+
+		local name = (params.name :: string?) or ("Asset_" .. tostring(assetId))
+		local stripScripts = if params.stripScripts == nil then true else (params.stripScripts :: boolean)
+
+		-- Use game:GetObjects for broader asset compatibility
+		local ok, instances = pcall(function()
+			return game:GetObjects("rbxassetid://" .. assetId)
+		end)
+
+		if not ok or not instances or #instances == 0 then
+			-- Fallback to InsertService
+			ok, instances = pcall(function()
+				local model = InsertService:LoadAsset(assetId)
+				local children = model:GetChildren()
+				model:Destroy()
+				return children
+			end)
+		end
+
+		if not ok or not instances or #instances == 0 then
+			error("Failed to load asset " .. tostring(assetId))
+		end
+
+		-- Get root instance
+		local rootInstance
+		if #instances == 1 then
+			rootInstance = instances[1]
+		else
+			local model = Instance.new("Model")
+			model.Name = name
+			for _, inst in instances do
+				inst.Parent = model
+			end
+			rootInstance = model
+		end
+
+		rootInstance.Name = name
+		rootInstance.Parent = parent
+
+		-- Optionally strip scripts for security
+		local scriptsRemoved = 0
+		if stripScripts then
+			for _, desc in rootInstance:GetDescendants() do
+				if desc:IsA("LuaSourceContainer") then
+					desc:Destroy()
+					scriptsRemoved += 1
+				end
+			end
+		end
+
+		local childCount = #rootInstance:GetDescendants()
+
+		return {
+			imported = true,
+			path = getPath(rootInstance),
+			className = rootInstance.ClassName,
+			name = rootInstance.Name,
+			childCount = childCount,
+			scriptsRemoved = scriptsRemoved,
+			assetId = assetId,
+		}
+	end)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- SERIALIZE: Snapshot an instance tree for rollback
+-- ═══════════════════════════════════════════════════════════
+
+handlers["serialize"] = function(params)
+	local instance = resolveInstance(params.path :: string)
+	if not instance then error("Instance not found: " .. params.path) end
+
+	local HttpService = game:GetService("HttpService")
+
+	local function serializeInstance(inst: Instance): { [string]: any }
+		local data: { [string]: any } = {
+			name = inst.Name,
+			className = inst.ClassName,
+			properties = {},
+			attributes = {},
+			children = {},
+		}
+
+		-- Serialize attributes using RbxDom
+		pcall(function()
+			local attrs = inst:GetAttributes()
+			if next(attrs) then
+				local ok, encoded = pcall(RbxDom.EncodedValue.encode, attrs, "Attributes")
+				if ok and encoded then
+					data.attributes = attrs -- Store raw for JSON compatibility
+				else
+					data.attributes = attrs
+				end
+			end
+		end)
+
+		-- Serialize common properties using RbxDom.EncodedValue for proper type handling
+		local tryProps = {
+			"Position", "Size", "CFrame", "Color", "BrickColor", "Transparency", "Anchored",
+			"CanCollide", "CanQuery", "CanTouch", "Material", "Reflectance", "Shape",
+			"Visible", "Enabled", "Value", "Text", "TextColor3", "BackgroundColor3",
+			"Image", "SoundId", "Volume", "Brightness", "Range",
+		}
+		for _, prop in tryProps do
+			pcall(function()
+				local val = (inst :: any)[prop]
+				-- Try RbxDom encoding first, fall back to DataTypeSerializer
+				local encOk, encoded = RbxDom.EncodedValue.encodeNaive(val)
+				if encOk then
+					data.properties[prop] = encoded
+				else
+					data.properties[prop] = DataTypeSerializer.serialize(val)
+				end
+			end)
+		end
+
+		-- Serialize script source
+		if inst:IsA("LuaSourceContainer") then
+			pcall(function() data.source = (inst :: any).Source end)
+		end
+
+		-- Recurse children
+		for _, child in inst:GetChildren() do
+			table.insert(data.children, serializeInstance(child))
+		end
+
+		return data
+	end
+
+	local serialized = serializeInstance(instance)
+	local jsonOk, json = pcall(HttpService.JSONEncode, HttpService, serialized)
+	if not jsonOk then error("Failed to serialize: " .. tostring(json)) end
+
+	return {
+		path = params.path,
+		className = instance.ClassName,
+		parentPath = if instance.Parent then getPath(instance.Parent) else nil,
+		data = json,
+		source = if instance:IsA("LuaSourceContainer") then (instance :: any).Source else nil,
+	}
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- DESERIALIZE: Recreate an instance from serialized data
+-- ═══════════════════════════════════════════════════════════
+
+handlers["deserialize"] = function(params)
+	return withRecording("Deserialize instance", function()
+		local parentPath = params.parentPath :: string
+		local parent = resolveInstance(parentPath)
+		if not parent then error("Parent not found: " .. parentPath) end
+
+		local HttpService = game:GetService("HttpService")
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, params.data :: string)
+		if not ok then error("Failed to decode serialized data") end
+
+		local function recreateInstance(nodeData: { [string]: any }, parentInst: Instance): Instance
+			local inst = Instance.new(nodeData.className)
+			inst.Name = nodeData.name
+
+			-- Apply properties
+			if nodeData.properties then
+				local props = DataTypeSerializer.deepDeserialize(nodeData.properties)
+				if props then
+					for prop, value in props :: any do
+						pcall(function() (inst :: any)[prop] = value end)
+					end
+				end
+			end
+
+			-- Apply attributes
+			if nodeData.attributes then
+				for key, value in nodeData.attributes :: any do
+					pcall(function() inst:SetAttribute(key, value) end)
+				end
+			end
+
+			-- Apply source
+			if nodeData.source and inst:IsA("LuaSourceContainer") then
+				pcall(function() (inst :: any).Source = nodeData.source end)
+			end
+
+			inst.Parent = parentInst
+
+			-- Recurse children
+			if nodeData.children then
+				for _, childData in nodeData.children :: any do
+					recreateInstance(childData, inst)
+				end
+			end
+
+			return inst
+		end
+
+		local instance = recreateInstance(data, parent)
+		local childCount = #instance:GetDescendants()
+
+		return {
+			created = true,
+			path = getPath(instance),
+			className = instance.ClassName,
+			childCount = childCount,
+		}
+	end)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- GET FULL SCRIPT SOURCE (no truncation, for AI reading)
+-- ═══════════════════════════════════════════════════════════
+
+handlers["getFullSource"] = function(params)
+	local instance = resolveInstance(params.path :: string)
+	if not instance then error("Script not found: " .. params.path) end
+	if not instance:IsA("LuaSourceContainer") then error("Not a script: " .. params.path) end
+
+	local ScriptEditorService = game:GetService("ScriptEditorService")
+	local source: string
+	local ok, editorSource = pcall(function()
+		return (ScriptEditorService :: any):GetEditorSource(instance)
+	end)
+	if ok and editorSource then
+		source = editorSource
+	else
+		source = (instance :: any).Source
+	end
+
+	return {
+		path = params.path,
+		className = instance.ClassName,
+		name = instance.Name,
+		source = source,
+		lineCount = #string.split(source, "\n"),
+	}
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- GET PLUGIN VERSION (for version compatibility checking)
+-- ═══════════════════════════════════════════════════════════
+
+handlers["getPluginVersion"] = function(_params)
+	return {
+		version = Config.PLUGIN_VERSION,
+		name = Config.PLUGIN_NAME,
+	}
 end
 
 -- ── Public API for registering custom command handlers ──

@@ -10,6 +10,8 @@ local APIClient = require(script.Parent.Parent.API.Client)
 local Config = require(script.Parent.Parent.Config)
 local Logger = require(script.Parent.Parent.Logger)
 local CommandExecutor = require(script.Parent.CommandExecutor)
+local InstanceMap = require(script.Parent.InstanceMap)
+local PatchSet = require(script.Parent.PatchSet)
 
 type ScriptEntry = {
 	name: string,
@@ -63,21 +65,20 @@ local _lastObjectHashes: { [string]: string } = {}   -- id -> hash of structure
 local _lastObjectIds: { [string]: boolean } = {}      -- set of all known object ids
 local _hasSentFullSync = false                         -- first sync must be full
 
--- Simple fast hash: use string.len + first/last/mid chars + a checksum
--- This avoids serializing the entire source just to detect changes
+-- Simple fast hash: FNV-1a inspired hash using all bytes for reliable change detection
 local function quickHash(s: string): string
 	local len = #s
 	if len == 0 then return "0:" end
-	-- Sample a few bytes for a fast fingerprint
-	local mid = math.floor(len / 2)
-	local q1 = math.floor(len / 4)
-	local q3 = math.floor(len * 3 / 4)
-	return tostring(len) .. ":" 
-		.. string.byte(s, 1) .. ":"
-		.. string.byte(s, mid > 0 and mid or 1) .. ":"
-		.. string.byte(s, q1 > 0 and q1 or 1) .. ":"
-		.. string.byte(s, q3 > 0 and q3 or 1) .. ":"
-		.. string.byte(s, len)
+	-- Sample every Nth byte to balance speed vs accuracy
+	-- For scripts under 4KB, hash every byte. Over 4KB, sample every 4th byte.
+	local step = if len <= 4096 then 1 else 4
+	local hash: number = 2166136261 -- FNV offset basis (32-bit)
+	for i = 1, len, step do
+		hash = bit32.bxor(hash, string.byte(s, i))
+		-- FNV prime multiply (simplified for Luau — use bit shifts)
+		hash = bit32.band(hash * 16777619, 0xFFFFFFFF)
+	end
+	return tostring(len) .. ":" .. tostring(hash)
 end
 
 -- Hash an object's structure (name + type + children count) without source.
@@ -108,12 +109,51 @@ local function scanAllFast(
 		end)
 		if ok and src then
 			source = src
+
+			-- Collect script metadata (properties + attributes) for .meta.json
+			local scriptMeta: { [string]: any } = {}
+
+			-- Disabled property
+			pcall(function()
+				if (instance :: any).Disabled == true then
+					scriptMeta.disabled = true
+				end
+			end)
+
+			-- RunContext for Scripts (not LocalScript/ModuleScript)
+			pcall(function()
+				if instance.ClassName == "Script" then
+					local rc = (instance :: any).RunContext
+					if rc and rc ~= Enum.RunContext.Legacy then
+						scriptMeta.runContext = rc.Name
+					end
+				end
+			end)
+
+			-- Custom attributes
+			pcall(function()
+				local attrs = instance:GetAttributes()
+				if next(attrs) then
+					scriptMeta.attributes = attrs
+				end
+			end)
+
+			-- Tags
+			pcall(function()
+				local CollectionService = game:GetService("CollectionService")
+				local tags = CollectionService:GetTags(instance)
+				if #tags > 0 then
+					scriptMeta.tags = tags
+				end
+			end)
+
 			table.insert(scripts, {
 				name = instance.Name,
 				path = myPath,
 				source = src,
 				className = instance.ClassName,
 				guid = id,
+				meta = if next(scriptMeta) then scriptMeta else nil,
 			})
 		end
 	end
@@ -358,6 +398,36 @@ function Sync.pushDataModel()
 	Logger.log("Sync", "Pushed DataModel tree to server")
 end
 
+-- Encode the game tree as JSONL (one line per instance) for compact transfer
+-- Format: each line is {path, className, childCount, isScript}
+function Sync.encodeProjectStructureJSONL(): string
+	local HttpService = game:GetService("HttpService")
+	local lines = {}
+
+	local function walkJSONL(instance: Instance, parentPath: string)
+		local myPath = if parentPath == "" then instance.Name else parentPath .. "/" .. instance.Name
+		local isScript = SCRIPT_CLASSES[instance.ClassName] == true
+		local children = instance:GetChildren()
+
+		table.insert(lines, HttpService:JSONEncode({
+			p = myPath,
+			c = instance.ClassName,
+			n = #children,
+			s = isScript or nil, -- only include if true to save bytes
+		}))
+
+		for _, child in children do
+			walkJSONL(child, myPath)
+		end
+	end
+
+	for _, root in ipairs(ROOTS) do
+		walkJSONL(root, "")
+	end
+
+	return table.concat(lines, "\n")
+end
+
 -- Push game state over WebSocket using delta sync
 -- First push sends full state, subsequent pushes send only changes
 function Sync.pushToServer()
@@ -387,6 +457,9 @@ end
 
 function Sync.applyWebEdits(edits: { any })
 	local ScriptEditorService = game:GetService("ScriptEditorService")
+
+	-- Pause watcher to prevent feedback loop
+	_watcherPaused = true
 
 	for _, entry in ipairs(edits) do
 		local ok, applyErr = pcall(function()
@@ -435,10 +508,23 @@ function Sync.applyWebEdits(edits: { any })
 			Logger.error("Sync", "Failed to apply edit for " .. tostring(entry.path) .. ": " .. tostring(applyErr))
 		end
 	end
+
+	-- Resume watcher after all edits applied
+	_watcherPaused = false
 end
 
 function Sync.executeCommands(commands: { any })
 	Logger.log("Sync", "Received " .. #commands .. " command(s) via WebSocket")
+
+	-- Pause watcher to prevent feedback loop (server writes → change detected → re-sync)
+	_watcherPaused = true
+
+	-- Begin a grouped ChangeHistoryService recording for the entire batch
+	local ChangeHistoryService = game:GetService("ChangeHistoryService")
+	local batchLabel = Config.PLUGIN_NAME .. ": AI batch (" .. #commands .. " commands)"
+	local recordingId = ChangeHistoryService:TryBeginRecording(batchLabel)
+	_activeRecordingId = recordingId
+
 	local results = {}
 
 	for _, cmd in ipairs(commands) do
@@ -450,6 +536,15 @@ function Sync.executeCommands(commands: { any })
 			error = if not success then tostring(result) else nil,
 		})
 	end
+
+	-- Finish the grouped recording
+	if recordingId then
+		ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Commit)
+	end
+	_activeRecordingId = nil
+
+	-- Resume watcher
+	_watcherPaused = false
 
 	if #results > 0 then
 		APIClient.wsReportResults(results)
@@ -464,6 +559,17 @@ function Sync.executeCommands(commands: { any })
 	end)
 end
 
+-- Finish any in-progress recording (called on plugin unload)
+function Sync.finishActiveRecording()
+	if _activeRecordingId then
+		local ChangeHistoryService = game:GetService("ChangeHistoryService")
+		pcall(function()
+			ChangeHistoryService:FinishRecording(_activeRecordingId :: string, Enum.FinishRecordingOperation.Commit)
+		end)
+		_activeRecordingId = nil
+	end
+end
+
 -- Combined auto-sync + WebSocket event listeners
 local _syncRunning = false
 local _cmdConnection: any = nil
@@ -474,6 +580,15 @@ local _changeConnections: { RBXScriptConnection } = {}
 local _pendingPush = false
 local _logConnection: RBXScriptConnection? = nil
 local _errorConnection: RBXScriptConnection? = nil
+
+-- Watcher pause: suppress change detection during server-applied writes
+local _watcherPaused = false
+
+-- Active ChangeHistoryService recording for grouped AI operations
+local _activeRecordingId: string? = nil
+
+-- InstanceMap for bidirectional ID↔Instance tracking
+local _instanceMap: typeof(InstanceMap.new()) = nil :: any
 
 -- ── Output batching state ──
 type OutputBufferEntry = {
@@ -512,12 +627,12 @@ end
 
 -- Debounced push: coalesces rapid changes into a single sync
 local function debouncedPush()
-	if _pendingPush then return end
+	if _pendingPush or _watcherPaused then return end
 	_pendingPush = true
 	task.defer(function()
 		task.wait(0.15) -- 150ms debounce
 		_pendingPush = false
-		if _syncRunning then
+		if _syncRunning and not _watcherPaused then
 			pcall(function() Sync.pushToServer() end)
 		end
 	end)
@@ -551,6 +666,16 @@ function Sync.startAutoSync(onStatus: ((status: string, msg: string) -> ())?, on
 
 	-- Reset delta state for fresh session
 	Sync.resetDeltaState()
+
+	-- Initialize InstanceMap for bidirectional ID tracking
+	_instanceMap = InstanceMap.new(function(instance: Instance, propertyName: string)
+		-- Property changed on a tracked instance — trigger debounced sync
+		if not _watcherPaused then
+			Logger.trace("Sync", "Property changed: " .. instance.Name .. "." .. propertyName)
+			debouncedPush()
+		end
+	end)
+	Logger.step("Sync", "InstanceMap initialized")
 
 	-- Reset output batching state for new session
 	_outputSeq = 0
@@ -700,6 +825,15 @@ function Sync.stopAutoSync()
 	-- Reset delta state
 	Sync.resetDeltaState()
 
+	-- Finish any active recording
+	Sync.finishActiveRecording()
+
+	-- Stop InstanceMap (disconnects all change signals)
+	if _instanceMap then
+		_instanceMap:stop()
+		_instanceMap = nil :: any
+	end
+
 	-- Clear output buffer
 	table.clear(_outputBuffer)
 	_outputFlushScheduled = false
@@ -744,6 +878,11 @@ end
 
 function Sync.isRunning(): boolean
 	return _syncRunning
+end
+
+-- Expose InstanceMap for other modules (e.g., CommandExecutor ID-based lookups)
+function Sync.getInstanceMap()
+	return _instanceMap
 end
 
 return Sync

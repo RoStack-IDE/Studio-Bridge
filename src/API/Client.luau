@@ -47,25 +47,52 @@ end
 -- Low-level HTTP request with optional auth (used for initial session claim + ping)
 local function request(method: string, endpoint: string, body: any?, useAuth: boolean?)
 	return Promise.new(function(resolve, reject)
-		local success, result = pcall(function()
-			local headers: { [string]: string } = {
-				["Content-Type"] = "application/json",
-				["X-Studio-Bridge"] = Config.PLUGIN_NAME .. "/" .. Config.PLUGIN_VERSION,
-			}
-			if useAuth ~= false and _sessionToken ~= "" then
-				headers["Authorization"] = "Bearer " .. _sessionToken
-			end
+		local url = _serverUrl .. endpoint
+		local headers: { [string]: string } = {
+			["Content-Type"] = "application/json",
+			["X-Studio-Bridge"] = Config.PLUGIN_NAME .. "/" .. Config.PLUGIN_VERSION,
+		}
+		if useAuth ~= false and _sessionToken ~= "" then
+			headers["Authorization"] = "Bearer " .. _sessionToken
+		end
 
-			local payload = {
-				Url = _serverUrl .. endpoint,
-				Method = method,
-				Headers = headers,
-				Body = body and HttpService:JSONEncode(body) or nil,
-			}
-			return HttpService:RequestAsync(payload)
+		local payload = {
+			Url = url,
+			Method = method,
+			Headers = headers,
+			Body = body and HttpService:JSONEncode(body) or nil,
+		}
+
+		-- Timeout wrapper: prevent hanging when network is disconnected
+		local TIMEOUT_SECONDS = Config.HTTP_TIMEOUT
+		local requestCompleted = false
+		local pcallSuccess, result
+
+		task.spawn(function()
+			pcallSuccess, result = pcall(function()
+				return HttpService:RequestAsync(payload)
+			end)
+			requestCompleted = true
 		end)
 
-		if not success then
+		if TIMEOUT_SECONDS > 0 then
+			local startTime = os.clock()
+			while not requestCompleted and (os.clock() - startTime) < TIMEOUT_SECONDS do
+				task.wait(0.1)
+			end
+
+			if not requestCompleted then
+				reject("Request timed out after " .. TIMEOUT_SECONDS .. "s: " .. method .. " " .. endpoint)
+				return
+			end
+		else
+			-- No timeout, wait indefinitely
+			while not requestCompleted do
+				task.wait(0.1)
+			end
+		end
+
+		if not pcallSuccess then
 			reject("HTTP request failed: " .. tostring(result))
 			return
 		end
@@ -138,6 +165,8 @@ function Client.wsSendHello(context: {
 		placeId = context.placeId,
 		placeVersion = context.placeVersion,
 		compositeKey = compositeKey,
+		pluginVersion = Config.PLUGIN_VERSION,
+		protocolVersion = Config.PROTOCOL_VERSION,
 	})
 end
 

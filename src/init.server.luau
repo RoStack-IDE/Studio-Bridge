@@ -2,6 +2,13 @@
 -- Studio Bridge Plugin Entry Point (Headless)
 -- Automatically discovers and connects to the server IDE.
 
+local RunService = game:GetService("RunService")
+
+-- Don't run during playtesting — only in Edit mode
+if RunService:IsRunning() then
+	return
+end
+
 local Config = require(script.Config)
 local Logger = require(script.Logger)
 
@@ -57,6 +64,10 @@ plugin.Unloading:Connect(function()
 	Logger.log("Init", "Plugin unloading...")
 	_running = false
 	Sync.stopAutoSync()
+
+	-- Finish any in-progress ChangeHistoryService recording to prevent orphans
+	Sync.finishActiveRecording()
+
 	APIClient.disconnect()
 end)
 
