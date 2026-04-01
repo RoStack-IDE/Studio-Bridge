@@ -1539,6 +1539,83 @@ handlers["getPluginVersion"] = function(_params)
 	}
 end
 
+-- ═══════════════════════════════════════════════════════════
+-- SHOW UPDATE NOTICE (in-Studio overlay when plugin is outdated)
+-- ═══════════════════════════════════════════════════════════
+
+handlers["showUpdateNotice"] = function(params)
+	local CoreGui = game:GetService("CoreGui")
+
+	-- Remove any existing notice
+	local existing = CoreGui:FindFirstChild("RoStackUpdateNotice")
+	if existing then existing:Destroy() end
+
+	local currentVersion = (params.currentVersion :: string?) or Config.PLUGIN_VERSION
+	local expectedVersion = (params.expectedVersion :: string?) or "latest"
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "RoStackUpdateNotice"
+	screenGui.DisplayOrder = 999998
+	screenGui.IgnoreGuiInset = true
+	screenGui.ResetOnSpawn = false
+
+	-- Container in bottom-right corner
+	local container = Instance.new("Frame")
+	container.Name = "Container"
+	container.Size = UDim2.new(0, 280, 0, 60)
+	container.Position = UDim2.new(1, -16, 1, -16)
+	container.AnchorPoint = Vector2.new(1, 1)
+	container.BackgroundColor3 = Color3.fromRGB(40, 30, 10)
+	container.BorderSizePixel = 0
+	container.Parent = screenGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = container
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(250, 204, 21)
+	stroke.Transparency = 0.6
+	stroke.Thickness = 1
+	stroke.Parent = container
+
+	-- Warning icon + text
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, -20, 0, 20)
+	title.Position = UDim2.new(0, 10, 0, 8)
+	title.BackgroundTransparency = 1
+	title.Text = "⚠ Plugin Outdated (v" .. currentVersion .. ")"
+	title.TextColor3 = Color3.fromRGB(250, 204, 21)
+	title.TextSize = 13
+	title.Font = Enum.Font.GothamBold
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = container
+
+	local subtitle = Instance.new("TextLabel")
+	subtitle.Name = "Subtitle"
+	subtitle.Size = UDim2.new(1, -20, 0, 16)
+	subtitle.Position = UDim2.new(0, 10, 0, 30)
+	subtitle.BackgroundTransparency = 1
+	subtitle.Text = "Update to v" .. expectedVersion .. " in the desktop app & restart"
+	subtitle.TextColor3 = Color3.fromRGB(200, 180, 100)
+	subtitle.TextSize = 11
+	subtitle.Font = Enum.Font.Gotham
+	subtitle.TextXAlignment = Enum.TextXAlignment.Left
+	subtitle.Parent = container
+
+	screenGui.Parent = CoreGui
+
+	-- Auto-dismiss after 15 seconds
+	task.delay(15, function()
+		if screenGui and screenGui.Parent then
+			screenGui:Destroy()
+		end
+	end)
+
+	return { shown = true, currentVersion = currentVersion, expectedVersion = expectedVersion }
+end
+
 -- ── Public API for registering custom command handlers ──
 
 -- ═══════════════════════════════════════════════════════════
