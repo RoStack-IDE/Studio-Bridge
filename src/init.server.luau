@@ -52,9 +52,7 @@ local function getOrCreateProjectId(): string
 	return newId
 end
 
-local _projectId = getOrCreateProjectId()
-
--- ── Auto-discover and connect loop ──
+local _projectId = getOrCreateProjectId()-- ── Auto-discover and connect loop ──
 -- Polls the server's /api/discover endpoint to find a session.
 -- Once found, claims it and starts auto-sync. On disconnect, loops back.
 
@@ -82,15 +80,18 @@ task.spawn(function()
 				if data.success then
 					Logger.step("Init", "Session found! ID=" .. tostring(data.sessionId))
 
+					-- Read projectId fresh each connection — the active place may have changed
+					local projectId = getOrCreateProjectId()
+
 					local gameContext = {
 						sessionId = _ephemeralSessionId,
-						projectId = _projectId,
+						projectId = projectId,
 						placeName = game.Name or "Untitled",
 						universeId = tostring(game.GameId),
 						placeId = tostring(game.PlaceId),
 						placeVersion = tostring(game.PlaceVersion),
 					}
-					Logger.step("Init", "Game context: projectId=" .. _projectId .. " universe=" .. gameContext.universeId .. " place=" .. gameContext.placeId)
+					Logger.step("Init", "Game context: projectId=" .. projectId .. " universe=" .. gameContext.universeId .. " place=" .. gameContext.placeId)
 
 					-- Start auto-sync (handles WebSocket, commands, edits, output)
 					Sync.startAutoSync(function(status: string, msg: string)
