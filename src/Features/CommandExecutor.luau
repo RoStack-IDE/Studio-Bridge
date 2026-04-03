@@ -131,6 +131,10 @@ handlers["deleteInstance"] = function(params)
 	return withRecording("Delete " .. tostring(params.path), function()
 		local instance = resolveInstance(params.path :: string)
 		if not instance then error("Instance not found: " .. params.path) end
+		-- Prevent deleting locked services (Workspace, ReplicatedStorage, etc.)
+		if instance.Parent == game then
+			error("Cannot delete a top-level service: " .. instance.ClassName)
+		end
 		local name = instance.Name
 		instance:Destroy()
 		return { deleted = true, path = params.path, name = name }
