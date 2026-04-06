@@ -142,6 +142,10 @@ handlers["deleteInstance"] = function(params)
 end
 
 handlers["setProperty"] = function(params)
+	-- Batch mode: if 'properties' map is present, delegate to setProperties handler
+	if params.properties then
+		return handlers["setProperties"](params)
+	end
 	return withRecording("Set property", function()
 		local instance = resolveInstance(params.path :: string)
 		if not instance then error("Instance not found: " .. params.path) end
@@ -1680,6 +1684,132 @@ handlers["installPackage"] = function(params)
 
 		error("Package installation should be handled via batch commands from the desktop app.")
 	end)
+end
+
+-- ═══════════════════════════════════════════════════════════
+-- CONSOLIDATED TOOL DISPATCHERS
+-- Thin wrappers that route action/shape params to existing handlers.
+-- The AI sends consolidated tool names; these map to the original handlers.
+-- ═══════════════════════════════════════════════════════════
+
+handlers["edit_instance"] = function(params)
+	local action = params.action :: string
+	if action == "move" then return handlers["moveInstance"](params)
+	elseif action == "clone" then return handlers["cloneInstance"](params)
+	elseif action == "rename" then return handlers["renameInstance"](params)
+	else error("Unknown edit_instance action: " .. tostring(action)) end
+end
+
+handlers["find_instances"] = function(params)
+	local depth = params.depth :: number?
+	local pattern = params.pattern :: string?
+	if pattern then
+		-- Glob mode
+		return handlers["glob"]({ pattern = pattern, classFilter = params.className, maxResults = params.maxResults })
+	elseif depth == 1 then
+		return handlers["getChildren"](params)
+	elseif params.className or params.namePattern then
+		return handlers["findInstances"]({ rootPath = params.path, className = params.className, namePattern = params.namePattern, maxResults = params.maxResults })
+	else
+		return handlers["getDescendants"]({ path = params.path, maxDepth = if depth == -1 then nil else depth })
+	end
+end
+
+handlers["metadata"] = function(params)
+	local action = params.action :: string
+	if action == "set_attr" then return handlers["setAttribute"](params)
+	elseif action == "get_attr" then return handlers["getAttribute"](params)
+	elseif action == "get_attrs" then return handlers["getAttributes"](params)
+	elseif action == "del_attr" then return handlers["deleteAttribute"](params)
+	elseif action == "add_tag" then return handlers["addTag"](params)
+	elseif action == "remove_tag" then return handlers["removeTag"](params)
+	elseif action == "get_tags" then return handlers["getTags"](params)
+	elseif action == "find_tagged" then return handlers["getTagged"](params)
+	else error("Unknown metadata action: " .. tostring(action)) end
+end
+
+handlers["terrain"] = function(params)
+	local shape = params.shape :: string
+	if shape == "block" then return handlers["terrainFillBlock"](params)
+	elseif shape == "ball" then return handlers["terrainFillBall"](params)
+	elseif shape == "cylinder" then return handlers["terrainFillCylinder"](params)
+	elseif shape == "wedge" then return handlers["terrainFillWedge"](params)
+	elseif shape == "clear" then return handlers["terrainClear"](params)
+	else error("Unknown terrain shape: " .. tostring(shape)) end
+end
+
+handlers["environment"] = function(params)
+	local action = params.action :: string
+	if action == "get_lighting" then return handlers["getLighting"](params)
+	elseif action == "set_lighting" then return handlers["setLighting"](params)
+	elseif action == "set_atmosphere" then return handlers["setAtmosphere"](params)
+	elseif action == "set_sky" then return handlers["setSky"](params)
+	elseif action == "set_post_effect" then return handlers["setPostEffect"](params)
+	else error("Unknown environment action: " .. tostring(action)) end
+end
+
+handlers["csg"] = function(params)
+	local action = params.action :: string
+	if action == "union" then return handlers["csgUnion"](params)
+	elseif action == "intersect" then return handlers["csgIntersect"](params)
+	elseif action == "negate" then return handlers["csgNegate"](params)
+	elseif action == "separate" then return handlers["csgSeparate"](params)
+	else error("Unknown csg action: " .. tostring(action)) end
+end
+
+handlers["studio"] = function(params)
+	local action = params.action :: string
+	if action == "get_selection" then return handlers["getSelection"](params)
+	elseif action == "set_selection" then return handlers["setSelection"](params)
+	elseif action == "undo" then return handlers["undoHistory"](params)
+	elseif action == "redo" then return handlers["redoHistory"](params)
+	elseif action == "get_settings" then return handlers["getStudioInfo"](params)
+	elseif action == "set_setting" then return handlers["setStudioSetting"](params)
+	elseif action == "set_gui_order" then return handlers["setGuiOrder"](params)
+	else error("Unknown studio action: " .. tostring(action)) end
+end
+
+handlers["asset"] = function(params)
+	local action = params.action :: string
+	if action == "insert" then return handlers["insertAsset"](params)
+	elseif action == "import_toolbox" then return handlers["importToolboxAsset"](params)
+	else error("Unknown asset action: " .. tostring(action)) end
+end
+
+handlers["script_info"] = function(params)
+	local action = params.action :: string
+	if action == "read" then return handlers["getFullSource"](params)
+	elseif action == "list_open" then return handlers["getOpenScripts"](params)
+	elseif action == "open" then return handlers["openScript"](params)
+	else error("Unknown script_info action: " .. tostring(action)) end
+end
+
+handlers["sound"] = function(params)
+	local action = params.action :: string
+	if action == "play" then return handlers["playSound"](params)
+	elseif action == "stop" then return handlers["stopSound"](params)
+	else error("Unknown sound action: " .. tostring(action)) end
+end
+
+handlers["animate"] = function(params)
+	local action = params.action :: string
+	if action == "tween" then return handlers["createTween"](params)
+	elseif action == "create_animation" then return handlers["createAnimation"](params)
+	else error("Unknown animate action: " .. tostring(action)) end
+end
+
+handlers["physics"] = function(params)
+	local action = params.action :: string
+	if action == "create_constraint" then return handlers["createConstraint"](params)
+	elseif action == "create_attachment" then return handlers["createAttachment"](params)
+	else error("Unknown physics action: " .. tostring(action)) end
+end
+
+handlers["snapshot"] = function(params)
+	local action = params.action :: string
+	if action == "save" then return handlers["serialize"](params)
+	elseif action == "restore" then return handlers["deserialize"]({ parentPath = params.path, data = params.data })
+	else error("Unknown snapshot action: " .. tostring(action)) end
 end
 
 function CommandExecutor.registerHandler(commandType: string, handler: (params: { [string]: any }) -> any)
